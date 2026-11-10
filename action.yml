@@ -1,13 +1,7 @@
 # Copyright 2026 Anchras BV
 # SPDX-License-Identifier: Apache-2.0
 name: Anchras tailnet policy
-description: >-
-  GitOps for an Anchras tailnet's policy document: test the
-  policy file on pull requests and apply it from the default branch, signed
-  in with a tailnet trust credential (workload identity federation with the
-  job's GitHub OIDC token, or an OAuth client secret). Use a policy_file:read
-  credential for test and a separate policy_file credential, behind a
-  protected environment, for apply. See README.md for setup and limitations.
+description: Test and apply Anchras tailnet policies with GitHub OIDC or OAuth credentials and cache-based drift detection.
 
 branding:
   icon: shield
