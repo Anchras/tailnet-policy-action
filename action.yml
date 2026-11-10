@@ -1,0 +1,214 @@
+# Copyright 2026 Anchras BV
+# SPDX-License-Identifier: Apache-2.0
+name: Anchras tailnet policy
+description: >-
+  GitOps for an Anchras tailnet's policy document: test the
+  policy file on pull requests and apply it from the default branch, signed
+  in with a tailnet trust credential (workload identity federation with the
+  job's GitHub OIDC token, or an OAuth client secret). Use a policy_file:read
+  credential for test and a separate policy_file credential, behind a
+  protected environment, for apply. See README.md for setup and limitations.
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  server:
+    description: Anchras server URL; must be https, e.g. https://platform.anchras.com.
+    required: true
+  tailnet:
+    description: >-
+      Tailnet UUID. Required: a policy_file credential cannot list tailnets.
+    required: true
+  policy-file:
+    description: Path of the policy document (JSON or HuJSON) in the repository.
+    required: false
+    default: policy.hujson
+  client-id:
+    description: >-
+      A federated identity's client ID (`anchras tailnets trust-credentials
+      create-federated`). The job needs `permissions: id-token: write`.
+    required: false
+    default: ''
+  audience:
+    description: The audience the federated identity expects in the GitHub OIDC token.
+    required: false
+    default: ''
+  client-secret:
+    description: >-
+      An OAuth client's secret, from a repository or environment secret.
+      Used when client-id is empty.
+    required: false
+    default: ''
+  action:
+    description: >-
+      `test`, `apply`, or `auto` (the default): apply on a push, scheduled
+      or manual run on the default branch, test otherwise.
+    required: false
+    default: auto
+  force:
+    description: >-
+      `true` writes over a policy edited outside the repository since the
+      last apply. Leave false and bring the edit into the file instead.
+    required: false
+    default: 'false'
+  cli-sha256:
+    description: >-
+      The SHA-256 the downloaded anchras CLI must have (for the runner's
+      platform). When empty, the CLI is checked against the .sha256 the
+      same server publishes next to it, which catches corruption in transit
+      but not a compromised server: pin it for stronger assurance.
+    required: false
+    default: ''
+
+outputs:
+  mode:
+    description: What ran, `test` or `apply`.
+    value: ${{ steps.mode.outputs.mode }}
+
+runs:
+  using: composite
+  steps:
+    - name: Choose test or apply
+      id: mode
+      shell: bash
+      env:
+        INPUT_ACTION: ${{ inputs.action }}
+        EVENT_NAME: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        case "$INPUT_ACTION" in
+          test|apply) mode="$INPUT_ACTION" ;;
+          auto)
+            mode="test"
+            case "$EVENT_NAME" in
+              push|schedule|workflow_dispatch)
+                if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then mode="apply"; fi ;;
+            esac ;;
+          *) echo "::error::action must be test, apply or auto, not '$INPUT_ACTION'"; exit 1 ;;
+        esac
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "Running: anchras tailnets policy $mode"
+
+    - name: Install the anchras CLI
+      shell: bash
+      env:
+        SERVER: ${{ inputs.server }}
+        PINNED_SHA256: ${{ inputs.cli-sha256 }}
+      run: |
+        set -euo pipefail
+        case "$SERVER" in
+          https://*) ;;
+          *) echo "::error::server must be an https URL, not '$SERVER'"; exit 1 ;;
+        esac
+        case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) echo "::error::unsupported runner OS $(uname -s)"; exit 1 ;; esac
+        case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;; esac
+        dir="$RUNNER_TEMP/anchras-cli"
+        mkdir -p "$dir"
+        base="${SERVER%/}/cli-releases/anchras-$os-$arch"
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$dir/anchras" "$base"
+        want="$PINNED_SHA256"
+        if [ -z "$want" ]; then
+          want="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$base.sha256" | awk '{print $1}')"
+        fi
+        if command -v sha256sum >/dev/null; then got="$(sha256sum "$dir/anchras" | awk '{print $1}')"; else got="$(shasum -a 256 "$dir/anchras" | awk '{print $1}')"; fi
+        if [ -z "$want" ] || [ "$want" != "$got" ]; then
+          echo "::error::anchras CLI checksum mismatch (want '$want', got '$got')"; exit 1
+        fi
+        chmod +x "$dir/anchras"
+        echo "$dir" >> "$GITHUB_PATH"
+
+    # The version the last apply wrote, kept between runs so an apply can
+    # tell an edit made in the dashboard from its own (`--etag-cache`).
+    # GitHub evicts a cache unused for 7 days: schedule the workflow weekly
+    # (see the docs) so the no-op apply keeps it and drift is still caught.
+    - name: Restore the last applied version
+      id: restore
+      if: steps.mode.outputs.mode == 'apply'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/anchras-policy-etag.json
+        key: anchras-tailnet-policy-${{ inputs.tailnet }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: anchras-tailnet-policy-${{ inputs.tailnet }}-
+
+    - name: Warn when no earlier apply was restored
+      if: steps.mode.outputs.mode == 'apply' && steps.restore.outputs.cache-matched-key == ''
+      shell: bash
+      run: |
+        echo "::warning title=Tailnet policy drift check is off for this run::No earlier apply was found in the Actions cache (the first run, or the cache was evicted after 7 days unused). This apply cannot tell an edit made in the dashboard since the last apply from its own and will write over it; it guards only against an edit made during this run. Schedule the workflow weekly to keep the cache."
+
+    # Credentials live only in these steps' environments: never in
+    # $GITHUB_ENV, never on disk (sign-in.sh).
+    - name: Test the policy
+      if: steps.mode.outputs.mode == 'test'
+      shell: bash
+      env:
+        ANCHRAS_SERVER: ${{ inputs.server }}
+        ANCHRAS_TAILNET: ${{ inputs.tailnet }}
+        POLICY_FILE: ${{ inputs.policy-file }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        AUDIENCE: ${{ inputs.audience }}
+        CLIENT_SECRET: ${{ inputs.client-secret }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        . "$ACTION_PATH/sign-in.sh"
+        anchras tailnets policy test --file "$POLICY_FILE"
+        # The change a merge would apply, in the job summary (public on a
+        # public repository).
+        set +e
+        diff="$(anchras tailnets policy diff --file "$POLICY_FILE" --exit-code)"
+        code=$?
+        set -e
+        {
+          echo "### Tailnet policy"
+          echo
+          echo "\`$POLICY_FILE\` is valid and its tests pass."
+          echo
+          if [ "$code" -eq 6 ]; then
+            echo "Merging applies this change:"
+            echo
+            echo '```diff'
+            echo "$diff"
+            echo '```'
+          elif [ "$code" -eq 0 ]; then
+            echo "It matches the live policy."
+          else
+            echo "The diff against the live policy failed (exit $code)."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$code" -ne 0 ] && [ "$code" -ne 6 ]; then exit "$code"; fi
+
+    - name: Apply the policy
+      if: steps.mode.outputs.mode == 'apply'
+      shell: bash
+      env:
+        ANCHRAS_SERVER: ${{ inputs.server }}
+        ANCHRAS_TAILNET: ${{ inputs.tailnet }}
+        POLICY_FILE: ${{ inputs.policy-file }}
+        FORCE: ${{ inputs.force }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        AUDIENCE: ${{ inputs.audience }}
+        CLIENT_SECRET: ${{ inputs.client-secret }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        . "$ACTION_PATH/sign-in.sh"
+        args=(--file "$POLICY_FILE" --etag-cache "$RUNNER_TEMP/anchras-policy-etag.json")
+        if [ "$FORCE" = true ]; then args+=(--force); fi
+        anchras tailnets policy apply "${args[@]}"
+
+    # A missing file (the provider reported no written version, so apply
+    # cleared it) only makes this step warn.
+    - name: Save the applied version
+      if: steps.mode.outputs.mode == 'apply' && success()
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/anchras-policy-etag.json
+        key: anchras-tailnet-policy-${{ inputs.tailnet }}-${{ github.run_id }}-${{ github.run_attempt }}
+
